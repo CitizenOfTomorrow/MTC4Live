@@ -46,7 +46,15 @@ MtcSender::~MtcSender()
 
 void MtcSender::startSending()
 {
-    startThread (juce::Thread::Priority::highest);
+    // Time-constraint thread: wakes up on time for each quarter frame. It does
+    // very little work per wakeup. Falls back to a normal high-priority thread.
+    const auto options = juce::Thread::RealtimeOptions{}
+                             .withPriority (8)
+                             .withProcessingTimeMs (0.1)
+                             .withMaximumProcessingTimeMs (1.0);
+
+    if (! startRealtimeThread (options))
+        startThread (juce::Thread::Priority::highest);
 }
 
 void MtcSender::setOutput (std::unique_ptr<CoreMidiOutput> newOutput)
