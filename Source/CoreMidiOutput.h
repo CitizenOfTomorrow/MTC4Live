@@ -29,8 +29,15 @@ public:
 
     ~CoreMidiOutput();
 
-    /** One complete MIDI message (or SysEx) per call, sent immediately. */
-    void send (const uint8_t* data, int size) const noexcept;
+    /** One complete MIDI message (or SysEx) per call. atMs is the time it
+        should go out, on the Time::getMillisecondCounterHiRes() clock; it may
+        be in the future (CoreMIDI schedules it) and 0 means now. */
+    void send (const uint8_t* data, int size, double atMs = 0.0) const noexcept;
+
+    /** Drops messages scheduled for the future but not delivered yet. Returns
+        false if this output can't do that (virtual sources deliver straight
+        away, timestamps included). */
+    bool flushPending() const noexcept;
 
     const juce::String& getIdentifier() const noexcept { return identifier; }
     const juce::String& getName() const noexcept       { return name; }

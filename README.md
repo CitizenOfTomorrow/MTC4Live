@@ -33,7 +33,7 @@ All settings are saved with the Live set.
 ## How it works
 
 - **Audio thread** (`processBlock`): reads the play head into a lock-free snapshot `{playing, position, wall time, discontinuity counter}`. It does no MIDI, no locking and no allocation. The position comes from `getTimeInSeconds()`. If that is missing, it is derived from PPQ, with tempo changes integrated so they do not look like jumps. A start, or a position jump of more than half a frame (a locate or a loop wrap), bumps the discontinuity counter. Offline render (freeze or export) counts as stopped.
-- **Sender thread** (`MtcSender`, real-time time-constraint priority): converts host position to wall time with a smoothed anchor, so it stays locked to the audio clock rather than drifting with wall time. It sends each quarter frame when it is due. When the discontinuity counter changes, or the rate, offset or port changes, it sends a full-frame SysEx and restarts the cycle at piece 0 on the next frame boundary. If no audio block arrives for 250 ms, it treats the transport as stopped (track frozen, device off, engine halted).
+- **Sender thread** (`MtcSender`, real-time time-constraint priority): converts host position to wall time with a smoothed anchor, so it stays locked to the audio clock rather than drifting with wall time. It hands each quarter frame to CoreMIDI about 20 ms early, stamped with its exact due time. CoreMIDI holds the message and delivers it on time, including on the virtual port, so a late thread wakeup inside a busy Live doesn't show up as jitter. The cost: after a locate on the virtual port, up to 20 ms of stale quarter frames still go out. The full frame is always stamped after them, so the receiver ends up in the right place. Hardware and IAC outputs drop those stale messages instead. When the discontinuity counter changes, or the rate, offset or port changes, it sends a full-frame SysEx and restarts the cycle at piece 0 on the next frame boundary. If no audio block arrives for 250 ms, it treats the transport as stopped (track frozen, device off, engine halted).
 - **MIDI output** (`CoreMidiOutput`): CoreMIDI is called directly, through the legacy `MIDIPacketList` API. JUCE 8's `MidiOutput` converts to UMP, and its SysEx does not reliably reach some hardware. Ports are opened and closed on the message thread. Sending happens on the sender thread.
 - **Timecode maths** (`TimecodeMath`, `MtcMessages`): pure C++ with no JUCE dependency. It covers drop-frame and 24-hour wrap. Every piece of a quarter-frame cycle encodes the frame on which piece 0 was sent, and the receiver adds the 2 frames.
 
@@ -58,6 +58,19 @@ The end-to-end test takes about 45 s. It drives the real processor in real time 
 - audio is bit-identical
 
 Typical result: sd about 0.4 ms, maximum about 2–3 ms.
+
+```bash
+./build/MTC4LiveTool_artefacts/Release/MTC4LiveTool monitor
+```
+
+This is a live MTC reader for checking the plugin inside Live without other software. It waits for the "Live MTC" port, and reconnects if the port is recreated. To read another source, pass its name as an argument. Each second it prints:
+
+- the decoded timecode and frame rate
+- quarter frames per second
+- interval jitter, read from the CoreMIDI timestamps
+- the latest arrival behind a message's timestamp
+
+Every full frame (start, locate, loop) gets its own line. Ctrl-C quits. Healthy output shows about 96–120 QF/s, jitter well under 1 ms, and no SEQUENCE ERRORS.
 
 ```bash
 ./build/MTC4LiveTool_artefacts/Release/MTC4LiveTool snapshot ui.png

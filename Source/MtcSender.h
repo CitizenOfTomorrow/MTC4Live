@@ -51,9 +51,14 @@ public:
 private:
     void run() override;
 
-    void sendBytes (const uint8_t* data, int size);
-    void sendQuarterFrame (uint8_t data);
-    void sendFullFrame (const mtc::Timecode&, mtc::FrameRate);
+    // Sender thread only. atMs is the intended output time on the
+    // getMillisecondCounterHiRes() clock; stamps are kept strictly increasing.
+    void sendBytes (const uint8_t* data, int size, double atMs);
+    void sendQuarterFrame (uint8_t data, double atMs);
+    void sendFullFrame (const mtc::Timecode&, mtc::FrameRate, double atMs);
+    void flushScheduled (double now);
+
+    double lastStampMs = 0.0; // sender thread only
 
     const TransportExchange& transport;
     const Settings settings;

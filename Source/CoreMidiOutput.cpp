@@ -1,6 +1,7 @@
 #include "CoreMidiOutput.h"
 
 #include <CoreMIDI/CoreMIDI.h>
+#include <mach/mach_time.h>
 
 namespace
 {
@@ -36,6 +37,25 @@ namespace
         SInt32 uid = 0;
         MIDIObjectGetIntegerProperty (endpoint, kMIDIPropertyUniqueID, &uid);
         return uid;
+    }
+
+    /** Time::getMillisecondCounterHiRes() value -> CoreMIDI host time. */
+    MIDITimeStamp hostTimeForMs (double ms) noexcept
+    {
+        static const double ticksPerMs = []
+        {
+            mach_timebase_info_data_t tb;
+            mach_timebase_info (&tb);
+            return 1.0e6 * (double) tb.denom / (double) tb.numer;
+        }();
+
+        const auto nowTicks = mach_absolute_time();
+        const auto deltaMs = ms - juce::Time::getMillisecondCounterHiRes();
+
+        if (deltaMs <= 0.0)
+            return nowTicks;
+
+        return nowTicks + static_cast<MIDITimeStamp> (deltaMs * ticksPerMs);
     }
 
     struct CFStr
@@ -139,7 +159,7 @@ std::unique_ptr<CoreMidiOutput> CoreMidiOutput::createVirtualSource (const juce:
     return std::unique_ptr<CoreMidiOutput> (new CoreMidiOutput (std::move (n), id, sourceName));
 }
 
-void CoreMidiOutput::send (const uint8_t* data, int size) const noexcept
+void CoreMidiOutput::send (const uint8_t* data, int size, double atMs) const noexcept
 {
     if (data == nullptr || size <= 0 || size > 200)
         return;
@@ -147,7 +167,8 @@ void CoreMidiOutput::send (const uint8_t* data, int size) const noexcept
     alignas (MIDIPacketList) Byte buffer[256];
     auto* packetList = reinterpret_cast<MIDIPacketList*> (buffer);
     auto* packet = MIDIPacketListInit (packetList);
-    packet = MIDIPacketListAdd (packetList, sizeof (buffer), packet, 0, static_cast<ByteCount> (size), data);
+    const MIDITimeStamp timeStamp = atMs > 0.0 ? hostTimeForMs (atMs) : 0;
+    packet = MIDIPacketListAdd (packetList, sizeof (buffer), packet, timeStamp, static_cast<ByteCount> (size), data);
 
     if (packet == nullptr)
         return;
@@ -156,4 +177,12 @@ void CoreMidiOutput::send (const uint8_t* data, int size) const noexcept
         MIDIReceived (native->virtualSource, packetList);
     else
         MIDISend (native->port, native->destination, packetList);
+}
+
+bool CoreMidiOutput::flushPending() const noexcept
+{
+    if (native->virtualSource != 0)
+        return false;
+
+    return MIDIFlushOutput (native->destination) == noErr;
 }

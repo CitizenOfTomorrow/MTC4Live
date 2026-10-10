@@ -20,8 +20,14 @@ namespace
     // bursting out the backlog.
     constexpr double maxLagFrames = 2.0;
 
+    // Quarter frames are handed to CoreMIDI this far ahead, timestamped with
+    // their exact due time, so late thread wakeups don't show up as jitter.
+    // After a locate on a virtual port, up to this much stale MTC still goes out
+    // (followed by the full frame).
+    constexpr double lookaheadMs = 20.0;
+
     // Longest sleep while generating, so transport changes are picked up quickly.
-    constexpr double maxSleepPlayingMs = 2.0;
+    constexpr double maxSleepPlayingMs = 4.0;
     constexpr int idleSleepMs = 10;
 
     void sleepMs (double ms)
@@ -83,23 +89,37 @@ juce::String MtcSender::getOutputIdentifier() const
     return outputIdentifier;
 }
 
-void MtcSender::sendBytes (const uint8_t* data, int size)
+void MtcSender::sendBytes (const uint8_t* data, int size, double atMs)
 {
+    // Never schedule before something already sent, so a full frame can't
+    // overtake quarter frames that are still in flight.
+    lastStampMs = juce::jmax (atMs, lastStampMs + 0.01);
+
     const std::lock_guard<std::mutex> lock (outputMutex);
     if (output != nullptr)
-        output->send (data, size);
+        output->send (data, size, lastStampMs);
 }
 
-void MtcSender::sendQuarterFrame (uint8_t data)
+void MtcSender::sendQuarterFrame (uint8_t data, double atMs)
 {
     const uint8_t bytes[] { mtc::quarterFrameStatus, data };
-    sendBytes (bytes, 2);
+    sendBytes (bytes, 2, atMs);
 }
 
-void MtcSender::sendFullFrame (const mtc::Timecode& tc, mtc::FrameRate rate)
+void MtcSender::sendFullFrame (const mtc::Timecode& tc, mtc::FrameRate rate, double atMs)
 {
     const auto bytes = mtc::fullFrameSysEx (tc, rate);
-    sendBytes (bytes.data(), static_cast<int> (bytes.size()));
+    sendBytes (bytes.data(), static_cast<int> (bytes.size()), atMs);
+}
+
+void MtcSender::flushScheduled (double now)
+{
+    const std::lock_guard<std::mutex> lock (outputMutex);
+
+    // Destinations can drop not-yet-delivered messages; virtual ports can't,
+    // so there the stamps stay ordered after what's in flight.
+    if (output != nullptr && output->flushPending())
+        lastStampMs = juce::jmin (lastStampMs, now);
 }
 
 void MtcSender::run()
@@ -134,6 +154,9 @@ void MtcSender::run()
 
         if (! (fresh && snap.playing && active))
         {
+            if (running)
+                flushScheduled (now);
+
             running = false;
             generating = false;
 
@@ -148,7 +171,7 @@ void MtcSender::run()
                 if (frame != lastStoppedFrame || rateIndex != lastStoppedRate
                     || offsetPacked != lastStoppedOffset || outGen != lastOutputGeneration)
                 {
-                    sendFullFrame (tc, rate);
+                    sendFullFrame (tc, rate, now);
                     lastStoppedFrame = frame;
                     lastStoppedRate = rateIndex;
                     lastStoppedOffset = offsetPacked;
@@ -182,11 +205,18 @@ void MtcSender::run()
 
         if (resync)
         {
+            if (running)
+                flushScheduled (now);
+
             anchorMs = measuredAnchor;
             positionFrames = (now - anchorMs + latencyMs) * 0.001 * fps;
 
-            const auto currentFrame = static_cast<int64_t> (std::floor (positionFrames));
-            sendFullFrame (mtc::framesToTimecode (currentFrame + offsetFrames, rate), rate);
+            // The full frame goes out after anything still in flight; encode
+            // the frame playing at that moment.
+            const auto fullFrameAt = juce::jmax (now, lastStampMs + 0.01);
+            const auto fullFramePosition = (fullFrameAt - anchorMs + latencyMs) * 0.001 * fps;
+            const auto currentFrame = static_cast<int64_t> (std::floor (fullFramePosition));
+            sendFullFrame (mtc::framesToTimecode (currentFrame + offsetFrames, rate), rate, fullFrameAt);
 
             // Quarter frames restart at piece 0 on the next frame boundary
             generator.restart (currentFrame + 1);
@@ -202,11 +232,17 @@ void MtcSender::run()
         currentTimecode = mtc::pack (mtc::framesToTimecode (
             static_cast<int64_t> (std::floor (positionFrames)) + offsetFrames, rate));
 
-        // Send everything that is due (normally exactly one message)
-        while (generator.nextDueFrame() <= positionFrames)
-            sendQuarterFrame (generator.next (offsetFrames, rate));
+        // Hand over everything due within the lookahead, stamped with its due
+        // time (host frame position -> wall time).
+        const auto horizonFrames = positionFrames + lookaheadMs * 0.001 * fps;
 
-        const auto untilNextMs = (generator.nextDueFrame() - positionFrames) / fps * 1000.0;
+        while (generator.nextDueFrame() <= horizonFrames)
+        {
+            const auto dueMs = anchorMs - latencyMs + generator.nextDueFrame() / fps * 1000.0;
+            sendQuarterFrame (generator.next (offsetFrames, rate), dueMs);
+        }
+
+        const auto untilNextMs = (generator.nextDueFrame() - horizonFrames) / fps * 1000.0;
         sleepMs (juce::jmin (untilNextMs, maxSleepPlayingMs));
     }
 
