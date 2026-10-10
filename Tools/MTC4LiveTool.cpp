@@ -77,6 +77,7 @@ struct Receiver
     MIDIClientRef client = 0;
     MIDIPortRef port = 0;
     MIDIEndpointRef connected = 0;
+    int matchingSources = 0; // from the last connect()
     std::mutex lock;
     std::vector<Received> events;
 
@@ -122,7 +123,9 @@ struct Receiver
         }
     }
 
-    bool connect (const juce::String& sourceName)
+    /** Connects to the source with this name, or with this CoreMIDI unique ID
+        if byUniqueId (needed when several ports share a name). */
+    bool connect (const juce::String& sourceName, bool byUniqueId = false)
     {
         if (client == 0 && MIDIClientCreate (CFSTR ("MTC4Live tool"), nullptr, nullptr, &client) != noErr)
             return false;
@@ -133,6 +136,9 @@ struct Receiver
             return false;
        #pragma clang diagnostic pop
 
+        MIDIEndpointRef match = 0;
+        matchingSources = 0;
+
         for (ItemCount i = 0; i < MIDIGetNumberOfSources(); ++i)
         {
             const auto src = MIDIGetSource (i);
@@ -141,20 +147,30 @@ struct Receiver
             const auto n = juce::String::fromCFString (s);
             if (s != nullptr) CFRelease (s);
 
-            if (n == sourceName)
+            SInt32 uid = 0;
+            MIDIObjectGetIntegerProperty (src, kMIDIPropertyUniqueID, &uid);
+
+            if (byUniqueId ? juce::String (uid) == sourceName : n == sourceName)
             {
-                if (src == connected)
-                    return true;
+                ++matchingSources;
 
-                if (connected != 0)
-                    MIDIPortDisconnectSource (port, connected);
-
-                connected = src;
-                return MIDIPortConnectSource (port, src, nullptr) == noErr;
+                // Stay on the current one if it still exists
+                if (match == 0 || src == connected)
+                    match = src;
             }
         }
 
-        return false;
+        if (match == 0)
+            return false;
+
+        if (match == connected)
+            return true;
+
+        if (connected != 0)
+            MIDIPortDisconnectSource (port, connected);
+
+        connected = match;
+        return MIDIPortConnectSource (port, match, nullptr) == noErr;
     }
 
     ~Receiver()
@@ -204,7 +220,7 @@ static bool runScenario (int rateIndex)
     juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
 
     Receiver receiver;
-    if (! processor.isPortConnected() || ! receiver.connect (MTC4LiveProcessor::virtualPortName))
+    if (! processor.isPortConnected() || ! receiver.connect (processor.getOpenPortIdentifier(), true))
     {
         std::printf ("  could not connect to virtual port\n");
         return false;
@@ -436,6 +452,7 @@ static int monitor (const juce::String& sourceName, double intervalSeconds)
             return 0;
     }
     std::printf ("Listening to \"%s\" (Ctrl-C to quit)\n", sourceName.toRawUTF8());
+    int warnedMatches = 1;
     std::fflush (stdout);
 
     static const char* rateNames[] { "24", "25", "29.97df", "30" };
@@ -521,6 +538,11 @@ static int monitor (const juce::String& sourceName, double intervalSeconds)
         }
 
         const auto now = juce::Time::getMillisecondCounterHiRes();
+
+        if (receiver.matchingSources > 1 && receiver.matchingSources != warnedMatches)
+            std::printf ("%s  WARNING: %d sources named \"%s\" (several MTC4Live instances?). Listening to one of them.\n",
+                         clock (now).toRawUTF8(), receiver.matchingSources, sourceName.toRawUTF8());
+        warnedMatches = juce::jmax (1, receiver.matchingSources);
 
         if (quarterFrames == 0)
         {

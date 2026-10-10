@@ -52,6 +52,7 @@ public:
     juce::String getSelectedPortIdentifier() const;
     juce::String getSelectedPortName() const;
     bool isPortConnected() const { return sender.hasOutput(); }
+    juce::String getOpenPortIdentifier() const { return sender.getOutputIdentifier(); } // CoreMIDI unique ID
 
     bool setStartOffset (const juce::String& text);
     juce::String getStartOffsetString() const;
